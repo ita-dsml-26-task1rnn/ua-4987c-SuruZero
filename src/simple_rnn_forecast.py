@@ -79,36 +79,19 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # ----------------------------
 
 def make_windows(series: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Convert a 1D time series into supervised windows for one-step forecasting.
+    """Перетворюємо часовий ряд у вікна для навчання."""
+    X, y = [], []
+    for i in range(len(series) - window):
+        X.append(series[i : i + window])
+        y.append(series[i + window])
+    
+    X = np.array(X)
+    y = np.array(y)
 
-    We build pairs for each time index t >= window:
-        X[t] = series[t-window : t]
-        y[t] = series[t]
-
-    Parameters
-    ----------
-    series : np.ndarray
-        One-dimensional time series of length T. Shape: (T,).
-        Must contain numeric finite values.
-    window : int
-        Window length w (number of past time steps). Must satisfy:
-        1 <= window < len(series).
-
-    Returns
-    -------
-    X : np.ndarray
-        Input windows with explicit feature dimension for Keras RNN layers.
-        Shape: (N, window, 1), where N = T - window.
-    y : np.ndarray
-        Targets (next value after each window).
-        Shape: (N, 1).
-
-    Notes
-    -----
-    Keras RNN layers expect inputs shaped as (batch, time, features).
-    Here features=1 because the time series is univariate.
-    """
-    raise NotImplementedError
+    X = X.reshape(-1, window, 1)
+    y = y.reshape(-1, 1)
+    
+    return X, y
 
 
 def time_split(
@@ -117,38 +100,19 @@ def time_split(
     train_frac: float = 0.70,
     val_frac: float = 0.15,
 ) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
-    """Split windows into train/val/test using time order (NO shuffling).
+    """Розподіл без перемішування для запобігання витоку даних."""
+    n = len(X)
+    train_end = int(n * train_frac)
+    val_end = int(n * (train_frac + val_frac))
 
-    This prevents *data leakage* typical for time series when random shuffling is used.
+    if train_end == 0 or val_end <= train_end or val_end >= n:
+        if n < 3: raise ValueError("Not enough data to split.")
 
-    Parameters
-    ----------
-    X : np.ndarray
-        Windowed inputs. Shape: (N, window, 1).
-    y : np.ndarray
-        Targets. Shape: (N, 1).
-    train_frac : float
-        Fraction of samples used for training, e.g. 0.70.
-    val_frac : float
-        Fraction of samples used for validation, e.g. 0.15.
-        Test fraction is computed as 1 - train_frac - val_frac.
+    X_train, y_train = X[:train_end], y[:train_end]
+    X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+    X_test, y_test = X[val_end:], y[val_end:]
 
-    Returns
-    -------
-    (X_train, y_train), (X_val, y_val), (X_test, y_test) : tuple
-        Time-preserving splits.
-
-    Raises
-    ------
-    ValueError
-        If fractions are invalid, or any split becomes empty.
-
-    Notes
-    -----
-    - Do NOT shuffle.
-    - The split is performed on already-windowed samples.
-    """
-    raise NotImplementedError
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
 
 
 def build_model(
@@ -158,35 +122,21 @@ def build_model(
     dropout: float = 0.2,
     learning_rate: float = 1e-3,
 ) -> tf.keras.Model:
-    """Build and compile an LSTM model for one-step forecasting.
+    """Будуємо LSTM архітектуру."""
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(window, 1)),
+        tf.keras.layers.LSTM(n_units),
+        tf.keras.layers.Dropout(dropout),
+        tf.keras.layers.Dense(dense_units, activation="relu"),
+        tf.keras.layers.Dense(1)
+    ])
 
-    Parameters
-    ----------
-    window : int
-        Number of time steps in each input window. Model input shape: (window, 1).
-    n_units : int
-        Number of LSTM units.
-    dense_units : int
-        Units in the intermediate Dense layer.
-    dropout : float
-        Dropout rate applied after the LSTM layer.
-    learning_rate : float
-        Learning rate for Adam optimizer.
-
-    Returns
-    -------
-    tf.keras.Model
-        Compiled model with:
-        - input shape:  (None, window, 1)
-        - output shape: (None, 1)
-        - loss: MSE
-        - metric: MAE
-
-    Notes
-    -----
-    You may change the architecture slightly, but keep I/O shapes the same.
-    """
-    raise NotImplementedError
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse",
+        metrics=["mae"]
+    )
+    return model
 
 
 def train_model(
@@ -199,53 +149,29 @@ def train_model(
     seed: int = 42,
     verbose: int = 0,
 ) -> Tuple[tf.keras.Model, np.ndarray, np.ndarray, tf.keras.callbacks.History]:
-    """Train an LSTM model on a time series and return model + test split.
+    """Повний цикл: від вікон до навченої моделі."""
+    tf.keras.utils.set_random_seed(seed)
 
-    Workflow
-    --------
-    1) Create windows: X, y = make_windows(series, window)
-    2) Time-based split: (X_train, y_train), (X_val, y_val), (X_test, y_test) = time_split(...)
-    3) Build model: model = build_model(window, ...)
-    4) Fit model on train with validation
-    5) Return (model, X_test, y_test, history)
+    X, y = make_windows(series, window)
+    
+    (X_train, y_train), (X_val, y_val), (X_test, y_test) = time_split(
+        X, y, train_frac, val_frac
+    )
 
-    Parameters
-    ----------
-    series : np.ndarray
-        1D time series. Shape: (T,).
-    window : int
-        Window length.
-    train_frac : float
-        Train fraction.
-    val_frac : float
-        Validation fraction.
-    epochs : int
-        Number of training epochs.
-    batch_size : int
-        Batch size.
-    seed : int
-        Random seed for reproducibility.
-    verbose : int
-        Verbosity for model.fit.
+    model = build_model(window)
 
-    Returns
-    -------
-    model : tf.keras.Model
-        Trained model.
-    X_test : np.ndarray
-        Test windows. Shape: (N_test, window, 1).
-    y_test : np.ndarray
-        Test targets. Shape: (N_test, 1).
-    history : tf.keras.callbacks.History
-        Keras training history.
+    callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-    Notes
-    -----
-    - Use time-based split to avoid leakage.
-    - Prefer using EarlyStopping (optional) to reduce overfitting.
-    - Keep the function deterministic as much as possible.
-    """
-    raise NotImplementedError
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=verbose,
+        callbacks=[callback]
+    )
+
+    return model, X_test, y_test, history
 
 
 # ----------------------------
